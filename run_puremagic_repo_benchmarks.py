@@ -177,6 +177,15 @@ def parse_required(pattern: str, output: str, description: str) -> re.Match[str]
     return match
 
 
+def parse_benchmark_wall_time(output: str, stage: str) -> float:
+    match = parse_required(
+        r"^Benchmark wall time:\s*([0-9.eE+-]+)\s*$",
+        output,
+        f"{stage} benchmark wall time",
+    )
+    return float(match.group(1))
+
+
 def parse_transpiler_output(output: str) -> dict:
     circuit = parse_required(
         r"Circuit has\s+(\d+)\s+gates on\s+(\d+)\s+qubits", output, "input circuit size"
@@ -205,6 +214,9 @@ def parse_scheduler_output(output: str) -> dict:
         "scheduled volume",
     )
     total = parse_required(r"^\s*total:\s+(\d+)\s*$", output, "topology qubit count")
+    data = parse_required(r"^\s*data:\s+(\d+)\s+", output, "data-patch count")
+    bus = parse_required(r"^\s*bus:\s+(\d+)\s+", output, "bus-patch count")
+    magic = parse_required(r"^\s*magic:\s+(\d+)\s+", output, "magic-patch count")
     loaded = parse_required(r"Loaded circuit with\s+(\d+)\s+products and\s+(\d+)\s+qubits", output, "loaded circuit")
     parallelism = parse_required(r"Parallelism:\s*([0-9.eE+-]+)x", output, "parallelism")
     efficiency = parse_required(r"Normalized scheduling efficiency:\s*([0-9.eE+-]+)", output, "efficiency")
@@ -219,6 +231,9 @@ def parse_scheduler_output(output: str) -> dict:
         "logical_cycles": int(scheduled.group(2)),
         "volume": int(scheduled.group(3)),
         "topology_qubit_count": int(total.group(1)),
+        "data_patch_count": int(data.group(1)),
+        "bus_patch_count": int(bus.group(1)),
+        "magic_patch_count": int(magic.group(1)),
         "transpiled_product_count": int(loaded.group(1)),
         "circuit_qubit_count": int(loaded.group(2)),
         "parallelism": float(parallelism.group(1)),
@@ -261,36 +276,52 @@ def run_one(stem: str, source_qasm: Path, args: argparse.Namespace) -> dict:
     ]
 
     print(f"\n--- {display} | {METHOD_LABEL} ---")
-    transpile_stdout, transpile_wall_time_s = tee_process(
+    process_wall_start = time.perf_counter()
+    transpile_stdout, transpile_process_wall_time_s = tee_process(
         transpile_command, cwd=RAW_DIR, log_path=transpile_log
     )
-    scheduler_stdout, scheduler_wall_time_s = tee_process(
+    scheduler_stdout, scheduler_process_wall_time_s = tee_process(
         scheduler_command, cwd=RAW_DIR, log_path=scheduler_log
     )
+    process_wall_time_s = time.perf_counter() - process_wall_start
     transpiler_metrics = parse_transpiler_output(transpile_stdout)
     scheduler_metrics = parse_scheduler_output(scheduler_stdout)
+    transpiler_wall_time_s = parse_benchmark_wall_time(transpile_stdout, "transpiler")
+    scheduler_wall_time_s = parse_benchmark_wall_time(scheduler_stdout, "scheduler")
+    transpiler_metrics["benchmark_wall_time_s"] = transpiler_wall_time_s
+    transpiler_metrics["process_wall_time_s"] = transpile_process_wall_time_s
+    scheduler_metrics["benchmark_wall_time_s"] = scheduler_wall_time_s
+    scheduler_metrics["process_wall_time_s"] = scheduler_process_wall_time_s
 
     space = scheduler_metrics["topology_qubit_count"]
     logical_time = scheduler_metrics["logical_cycles"]
     volume = scheduler_metrics["volume"]
     if space * logical_time != volume:
         raise RuntimeError(f"{stem}: expected volume {space} * {logical_time}, got {volume}")
+    patch_breakdown = sum(
+        scheduler_metrics[key]
+        for key in ("data_patch_count", "bus_patch_count", "magic_patch_count")
+    )
+    if patch_breakdown != space:
+        raise RuntimeError(
+            f"{stem}: topology breakdown sums to {patch_breakdown}, expected {space}"
+        )
     if scheduler_metrics["t_gate_failure_count"] != 0:
         raise RuntimeError(f"{stem}: T gate failures were not disabled")
 
-    pipeline_wall_time_s = transpile_wall_time_s + scheduler_wall_time_s
+    pipeline_wall_time_s = transpiler_wall_time_s + scheduler_wall_time_s
     metrics = {
         "space": float(space),
         "time": float(logical_time),
         "volume": float(volume),
         "compilation_time_s": float(scheduler_wall_time_s),
         "wall_time_s": float(pipeline_wall_time_s),
-        "process_wall_time_s": float(pipeline_wall_time_s),
+        "process_wall_time_s": float(process_wall_time_s),
     }
     print(
         f"space={space}, time={logical_time}, space-time={volume}, "
-        f"transpile={transpile_wall_time_s:.3f}s, schedule={scheduler_wall_time_s:.3f}s, "
-        f"pipeline={pipeline_wall_time_s:.3f}s"
+        f"transpile={transpiler_wall_time_s:.3f}s, schedule={scheduler_wall_time_s:.3f}s, "
+        f"fair-wall={pipeline_wall_time_s:.3f}s, process-wall={process_wall_time_s:.3f}s"
     )
 
     return {
@@ -336,14 +367,36 @@ def new_payload(selected: list[str], benchmark_dir: Path, args: argparse.Namespa
             "random_seed": args.seed,
             "ancilla_rows": args.ancilla_rows,
             "metric_definition": {
-                "space": "PureMagic topology logical-qubit count (data plus ancilla patches)",
-                "time": "scheduled logical cycles",
-                "volume": "space * time",
+                "space": (
+                    "Number of nodes in the generated logical-patch topology: data patches "
+                    "+ bus patches + magic patches. With --use-magic-routing, magic patches "
+                    "also serve as routing ancillas."
+                ),
+                "time": (
+                    "Number of PureMagic scheduling lcycles. Each lcycle packs mutually "
+                    "compatible routed Pauli products; this is a compiler scheduling step, "
+                    "not classical wall-clock time."
+                ),
+                "volume": (
+                    "space * time, i.e. the fixed topology-node count multiplied by all "
+                    "scheduled lcycles. Magic-state factory hardware outside the modeled "
+                    "magic patches is not included."
+                ),
             },
             "runtime_definition": {
-                "wall_time_s": "QASM-to-schedule pipeline wall time (transpiler plus scheduler subprocesses)",
-                "compilation_time_s": "PureMagic scheduler subprocess wall time after transpilation",
-                "process_wall_time_s": "Same complete pipeline interval as wall_time_s",
+                "wall_time_s": (
+                    "Fair QASM-to-final-in-memory-schedule wall time: internal Rust transpiler "
+                    "timer plus internal Rust scheduler timer. Starts before QASM parsing, "
+                    "includes the required intermediate .trans write/read, and excludes CLI "
+                    "startup and final .schedule serialization."
+                ),
+                "compilation_time_s": (
+                    "Internal PureMagic scheduler timer after transpilation; diagnostic only."
+                ),
+                "process_wall_time_s": (
+                    "Full outer two-stage pipeline interval, including both process startups, "
+                    "the inter-process handoff, and artifact serialization."
+                ),
             },
         },
         "benchmarks": [],

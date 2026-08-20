@@ -8,6 +8,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
+use std::time::Instant;
 
 #[allow(dead_code)]
 mod pauliproduct;
@@ -780,6 +781,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    // Fair cross-compiler timer: begin immediately before QASM parsing.  The
+    // intermediate .trans write is included because it is required by the
+    // public two-stage PureMagic pipeline.
+    let benchmark_wall_start = Instant::now();
     println!("Loading compiled circuit from {}", input_file);
     let _load_timer = Timer::new("load circuit");
     let (n_qubits, gates) = parse_qasm(input_file)?;
@@ -862,6 +867,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (n_ts, n_cliffords_written) = write_trans(&output_path, &items)?;
     println!("Wrote transpiled circuit to {}", output_path);
     println!("Wrote {} T gates and {} Cliffords", n_ts, n_cliffords_written);
+    println!("Benchmark wall time: {:.9}", benchmark_wall_start.elapsed().as_secs_f64());
 
     Ok(())
 }

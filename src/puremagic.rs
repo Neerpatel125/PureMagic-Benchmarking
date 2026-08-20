@@ -1,6 +1,7 @@
 use clap::Parser;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use std::time::Instant;
 
 mod astar;
 mod circuit;
@@ -108,6 +109,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}\n{:#?}", hdr, args);
     hdr = format!("# {}\n# {:?}", &hdr, args);
     let circuit_fname = args.circuit_fname;
+    // Fair cross-compiler timer: begin immediately before reading the
+    // transpiled circuit and stop once the final schedule and metrics exist in
+    // memory.  Final .schedule serialization is deliberately excluded.
+    let benchmark_wall_start = Instant::now();
     let mut circuit = Circuit::new(&circuit_fname);
     circuit.load_circuit()?;
     let n_products = circuit.n_products();
@@ -185,6 +190,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Max parallelism estimate: {:.3}", max_parallelism_estimate);
     println!("Volume estimate: {}", vmin);
     println!("Normalized scheduling efficiency: {:.3}", (vmin as f64 / volume as f64).min(1.0));
+    println!("Benchmark wall time: {:.9}", benchmark_wall_start.elapsed().as_secs_f64());
 
     sched.print_schedule(&hdr)?;
     Ok(())
