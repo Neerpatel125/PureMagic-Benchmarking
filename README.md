@@ -132,6 +132,26 @@ After scheduling, the following files are produced. Throughout the output, **lcy
 | `<name>.qubit_coupling.svg` | Qubit coupling matrix heatmap (requires `--plot coupling`). |
 | `<name>.paths/` | Per-lcycle path visualizations (requires `--plot paths`). |
 
+## TopoLS comparison benchmarks
+
+`run_puremagic_repo_benchmarks.py` runs the same nine QASM circuits used by the
+TopoLS and myTopoLS repository benchmark runners and writes their schema-version-2
+JSON format. The comparison preset uses PureMagic routing, lightweight PBC
+(`omega=1`), disabled T-injection failures, and `-m 100` so magic states are
+effectively immediately available, matching the paper's page-7 comparison setup.
+
+```bash
+# Short smoke test (BV, DJ, GHZ)
+python3 run_puremagic_repo_benchmarks.py --preset quick
+
+# All shared circuits, with the JSON placed in the plotting repository
+python3 run_puremagic_repo_benchmarks.py --preset all \
+  --results-file ../TopoLS-myTopoLS-Benchmarking-Results/results/puremagic_repo_results.json
+```
+
+Results are saved after every circuit. Add `--resume` to continue an interrupted
+run without repeating completed circuits.
+
 ## Topology File Format
 
 Topologies can be provided as a text file with node labels, grid positions, and types, with m for magic, b for bus, and d for data. The data qubits are double, and marked with X and Z. For example, here is an 8-data qubit topology:
