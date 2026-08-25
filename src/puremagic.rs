@@ -162,6 +162,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(n_scheduled >= n_products);
     let volume = n_qubits * tot_lcycles;
     println!("Scheduled {} in {} logical cycles, volume {}", n_scheduled, tot_lcycles, volume);
+    println!(
+        "Magic-state delay: {} logical cycles",
+        sched.magic_state_delay_lcycles
+    );
     if !args.no_t_failures && n_sx_cliffords > 0 {
         let corrections = sched.correction_gates_emitted;
         println!(

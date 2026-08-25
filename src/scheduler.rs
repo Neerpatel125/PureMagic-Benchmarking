@@ -184,6 +184,11 @@ pub(crate) struct Scheduler {
     /// CX occupies 2 lcycles; S/SX occupy 3.
     clifford_paths: IndexMap<i32, (usize, PauliProduct, Vec<u16>, Option<Rc<TreeGraph>>)>,
     pub(crate) t_gate_failures: usize,
+    /// Logical cycles in which dependency-ready T products existed but the
+    /// scheduler made no progress because every magic node was still cultivating.
+    /// Work on other products hides a T wait and is therefore not counted as
+    /// critical-path delay.
+    pub(crate) magic_state_delay_lcycles: usize,
     pub(crate) correction_gates_emitted: usize,
     pub(crate) stree_computation: SteinerTree,
     pub(crate) astar: AStar,
@@ -260,6 +265,7 @@ impl Scheduler {
             used: vec![false; n_nodes],
             clifford_paths: IndexMap::new(),
             t_gate_failures: 0,
+            magic_state_delay_lcycles: 0,
             correction_gates_emitted: 0,
             stree_computation: SteinerTree::new(n_nodes),
             astar: AStar::new(n_nodes),
@@ -296,6 +302,7 @@ impl Scheduler {
     /// Greedily assigns products to lcycles. Returns (total lcycles, total scheduled products).
     pub(crate) fn sched_circuit(&mut self) -> io::Result<(usize, usize)> {
         let _timer = fn_timer!();
+        self.magic_state_delay_lcycles = 0;
         self.cultivation
             .set_lambda(self.magic_state_lambda)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -416,9 +423,22 @@ impl Scheduler {
                 // (e.g. correction S gate emission temporarily failed), they don't need
                 // magic and will route once the area frees up; don't error in that case.
                 let has_pending_t = self.pps_pending.iter().any(|pp| pp.gate_type.is_t());
+                let ready_magic = self
+                    .cultivation
+                    .magic_node_ids
+                    .iter()
+                    .filter(|&&node_id| self.input.topo.cultivation_times[node_id as usize] == 0)
+                    .count();
+                let has_cultivating_magic = self
+                    .cultivation
+                    .magic_node_ids
+                    .iter()
+                    .any(|&node_id| self.input.topo.is_cultivating(node_id));
+                if has_pending_t && ready_magic == 0 && has_cultivating_magic {
+                    self.magic_state_delay_lcycles += 1;
+                }
                 if has_pending_t
-                    && !(0..self.input.topo.n_nodes)
-                        .any(|node_i| self.input.topo.is_cultivating(node_i as u16))
+                    && !has_cultivating_magic
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
