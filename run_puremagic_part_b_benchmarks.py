@@ -7,7 +7,10 @@ stochastic T-injection failures enabled, and records critical-path magic-state
 delay emitted by the instrumented scheduler.
 
 Example:
-    python3 run_puremagic_part_b_benchmarks.py --preset quick
+    python3 run_puremagic_part_b_benchmarks.py --max-gates 10000
+
+The summary JSON is written to LS-Benchmarking-Results, while raw logs and
+artifacts stay in PureMagic/results/benchmarking.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ import run_puremagic_repo_benchmarks as common
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_BENCHMARK_DIR = REPO_ROOT.parent / "TopoLS" / "docs" / "benchmark"
+DEFAULT_BENCHMARK_DIR = common.DEFAULT_BENCHMARK_DIR
 DEFAULT_RESULTS = (
     REPO_ROOT.parent
     / "LS-Benchmarking-Results"
@@ -34,6 +37,7 @@ DEFAULT_RESULTS = (
     / "results"
     / "puremagic_part_b_results.json"
 )
+DEFAULT_RAW_DIR = REPO_ROOT / "results" / "benchmarking" / "raw_puremagic_part_b"
 DEFAULT_TRANSPILE = REPO_ROOT / "target" / "release" / "transpile"
 DEFAULT_SCHEDULER = REPO_ROOT / "target" / "release" / "puremagic"
 METHOD_NAME = "puremagic_part_b_supply"
@@ -47,9 +51,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run PureMagic with the myTopoLS Part-B magic-state supply settings."
     )
-    parser.add_argument("--preset", choices=common.PRESETS, default="quick")
-    parser.add_argument("--benchmarks", nargs="+", choices=list(common.CASES))
+    parser.add_argument(
+        "--benchmarks",
+        nargs="+",
+        help="QASM stems to consider (default: every QASM in --benchmark-dir).",
+    )
     parser.add_argument("--benchmark-dir", type=Path, default=DEFAULT_BENCHMARK_DIR)
+    parser.add_argument(
+        "--max-gates",
+        type=int,
+        default=10_000,
+        help="Skip circuits above this gate count (default: 10000; 0 disables).",
+    )
     parser.add_argument("--results-file", type=Path, default=DEFAULT_RESULTS)
     parser.add_argument("--transpiler", type=Path, default=DEFAULT_TRANSPILE)
     parser.add_argument("--scheduler", type=Path, default=DEFAULT_SCHEDULER)
@@ -256,6 +269,7 @@ def new_payload(selected: list[str], benchmark_dir: Path, args: argparse.Namespa
         "selected_methods": [METHOD_NAME],
         "benchmark_source_dir": str(benchmark_dir),
         "shared_puremagic_part_b_config": {
+            "max_gates": args.max_gates,
             "routing": "PureMagic dual-purpose magic/ancilla routing",
             "use_magic_routing": True,
             "max_pauli_product_weight": MAX_PAULI_PRODUCT_WEIGHT,
@@ -313,17 +327,49 @@ def main() -> None:
     args.results_file = args.results_file.expanduser().resolve()
     args.transpiler = args.transpiler.expanduser().resolve()
     args.scheduler = args.scheduler.expanduser().resolve()
-    selected = args.benchmarks or common.PRESETS[args.preset]
     if args.magic_state_lambda <= 0:
         raise ValueError("--magic-state-lambda must be positive")
     if args.ancilla_rows < 1:
         raise ValueError("--ancilla-rows must be at least 1")
     if args.timeout_s <= 0:
         raise ValueError("--timeout-s must be positive")
+    if args.max_gates < 0:
+        raise ValueError("--max-gates must be >= 0")
     if not args.seeds or len(set(args.seeds)) != len(args.seeds):
         raise ValueError("--seeds must be a non-empty list of unique integers")
     if not args.benchmark_dir.is_dir():
         raise FileNotFoundError(args.benchmark_dir)
+
+    metadata_by_stem: dict[str, dict] = {}
+    paths = common.benchmark_paths(args.benchmark_dir, args.benchmarks)
+    print("Source:    ", args.benchmark_dir)
+    print("Max gates: ", args.max_gates or "disabled")
+    print("\n" + "=" * 84)
+    print("INPUT CIRCUIT SUMMARY")
+    print("=" * 84)
+    for qasm in paths:
+        stem = qasm.stem
+        metadata = common.qasm_metadata(qasm)
+        if args.max_gates and metadata["gate_count"] > args.max_gates:
+            print(
+                f"SKIP {stem:<36} gates={metadata['gate_count']:<7} "
+                f"(limit {args.max_gates})"
+            )
+            continue
+        if metadata["unsupported_gate_counts"]:
+            raise RuntimeError(f"{stem}: unsupported gates {metadata['unsupported_gate_counts']}")
+        metadata_by_stem[stem] = metadata
+        print(
+            f"RUN  {stem:<36} qubits={metadata['num_qubits']:<3} "
+            f"gates={metadata['gate_count']:<5} depth={metadata['depth']:<5} "
+            f"T={metadata['t_count']:<5}"
+        )
+    print("=" * 84)
+
+    selected = list(metadata_by_stem)
+    if not selected:
+        print("\nNo circuits are within the gate limit; nothing to run.")
+        return
 
     if args.build:
         build_release_binaries()
@@ -331,7 +377,7 @@ def main() -> None:
         if not binary.exists():
             raise FileNotFoundError(binary)
 
-    raw_dir = args.results_file.parent / "raw_puremagic_part_b"
+    raw_dir = DEFAULT_RAW_DIR
     raw_dir.mkdir(parents=True, exist_ok=True)
     if args.resume and args.results_file.exists():
         payload = json.loads(args.results_file.read_text(encoding="utf-8"))
@@ -350,6 +396,8 @@ def main() -> None:
             and int(config["ancilla_rows"]) != args.ancilla_rows
         ):
             raise ValueError("Cannot --resume with a different --ancilla-rows")
+        if config.get("max_gates") not in (None, args.max_gates):
+            raise ValueError("Cannot --resume with a different --max-gates")
         payload["selected_benchmarks"] = list(
             dict.fromkeys(payload.get("selected_benchmarks", []) + selected)
         )
@@ -363,16 +411,12 @@ def main() -> None:
     print("T failures: enabled")
     for stem in selected:
         qasm = args.benchmark_dir / f"{stem}.qasm"
-        if not qasm.exists():
-            raise FileNotFoundError(qasm)
-        metadata = common.qasm_metadata(qasm)
-        if metadata["unsupported_gate_counts"]:
-            raise RuntimeError(f"{stem}: unsupported gates {metadata['unsupported_gate_counts']}")
+        metadata = metadata_by_stem[stem]
         entry = find_entry(payload, stem)
         if entry is None:
             entry = {
                 "stem": stem,
-                "display_name": common.CASES[stem]["display_name"],
+                "display_name": stem,
                 **metadata,
                 "runs": [],
             }
@@ -386,7 +430,7 @@ def main() -> None:
             print(f"Skipping completed {stem}")
             continue
 
-        print(f"\n--- {common.CASES[stem]['display_name']} | PureMagic Part-B supply ---")
+        print(f"\n--- {stem} | PureMagic Part-B supply ---")
         transpiler = run_transpiler(stem, qasm, args, raw_dir)
         trials = [
             run_scheduler_trial(

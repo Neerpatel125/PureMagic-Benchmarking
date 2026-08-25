@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Benchmark PureMagic on the TopoLS repository QASM circuits.
+"""Benchmark PureMagic on the shared LS-Benchmarking QASM circuits.
 
 Run from the PureMagic repository root:
 
-    python3 run_puremagic_repo_benchmarks.py --preset quick
+    python3 run_puremagic_repo_benchmarks.py
 
-For comparison plots alongside TopoLS and myTopoLS, write the JSON directly to
-the benchmarking-results repository:
+The JSON result is written directly to the sibling LS-Benchmarking-Results
+repository by default.
 
-    python3 run_puremagic_repo_benchmarks.py --preset all \
-        --results-file ../LS-Benchmarking-Results/results/puremagic_repo_results.json
+Circuits above 10,000 gates are skipped by default. Change the cutoff with
+``--max-gates``; use 0 to disable it.
 
 The default configuration uses PureMagic routing, lightweight PBC (omega=1),
 disabled stochastic T-injection failures, and the repository's high-production
@@ -31,29 +31,18 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_BENCHMARK_DIR = REPO_ROOT.parent / "TopoLS" / "docs" / "benchmark"
-DEFAULT_RESULTS = REPO_ROOT / "results" / "benchmarking" / "puremagic_repo_results.json"
+DEFAULT_BENCHMARK_DIR = (
+    REPO_ROOT.parent / "LS-Benchmarking-Results" / "Benchmarks" / "QASM"
+)
+DEFAULT_RESULTS = (
+    REPO_ROOT.parent
+    / "LS-Benchmarking-Results"
+    / "results"
+    / "puremagic_repo_results.json"
+)
 RAW_DIR = REPO_ROOT / "results" / "benchmarking" / "raw_puremagic"
 DEFAULT_TRANSPILE = REPO_ROOT / "target" / "release" / "transpile"
 DEFAULT_SCHEDULER = REPO_ROOT / "target" / "release" / "puremagic"
-
-CASES = {
-    "bv_16": {"display_name": "BV"},
-    "dj_16": {"display_name": "DJ"},
-    "grover_6": {"display_name": "Grover"},
-    "qft_16": {"display_name": "QFT"},
-    "qpe_16": {"display_name": "QPE"},
-    "vqe_16": {"display_name": "VQE"},
-    "ghz_16": {"display_name": "GHZ"},
-    "wstate_16": {"display_name": "W-state"},
-    "qaoa_16": {"display_name": "QAOA"},
-}
-
-PRESETS = {
-    "quick": ["bv_16", "dj_16", "ghz_16"],
-    "medium": ["bv_16", "dj_16", "ghz_16", "vqe_16", "qaoa_16", "wstate_16"],
-    "all": list(CASES),
-}
 
 METHOD_NAME = "puremagic_ready_magic"
 METHOD_LABEL = "PureMagic (ready magic)"
@@ -66,11 +55,20 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run PureMagic with readily available magic states on TopoLS QASM benchmarks."
+        description="Run PureMagic on the shared LS-Benchmarking QASM circuits."
     )
-    parser.add_argument("--preset", choices=PRESETS, default="quick")
-    parser.add_argument("--benchmarks", nargs="+", choices=list(CASES))
+    parser.add_argument(
+        "--benchmarks",
+        nargs="+",
+        help="QASM stems to consider (default: every QASM in --benchmark-dir).",
+    )
     parser.add_argument("--benchmark-dir", type=Path, default=DEFAULT_BENCHMARK_DIR)
+    parser.add_argument(
+        "--max-gates",
+        type=int,
+        default=10_000,
+        help="Skip circuits above this gate count (default: 10000; 0 disables).",
+    )
     parser.add_argument("--results-file", type=Path, default=DEFAULT_RESULTS)
     parser.add_argument("--transpiler", type=Path, default=DEFAULT_TRANSPILE)
     parser.add_argument("--scheduler", type=Path, default=DEFAULT_SCHEDULER)
@@ -136,6 +134,19 @@ def qasm_metadata(path: Path) -> dict:
         "t_count": gate_counts.get("T", 0) + gate_counts.get("TDG", 0),
         "unsupported_gate_counts": unsupported,
     }
+
+
+def benchmark_paths(benchmark_dir: Path, requested: list[str] | None) -> list[Path]:
+    if requested:
+        paths = [benchmark_dir / f"{stem}.qasm" for stem in requested]
+        missing = [path for path in paths if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f"Missing benchmark: {missing[0]}")
+        return paths
+    paths = sorted(benchmark_dir.glob("*.qasm"))
+    if not paths:
+        raise RuntimeError(f"No QASM files found in {benchmark_dir}")
+    return paths
 
 
 def write_payload(path: Path, payload: dict) -> None:
@@ -251,7 +262,7 @@ def build_release_binaries() -> None:
 
 
 def run_one(stem: str, source_qasm: Path, args: argparse.Namespace) -> dict:
-    display = CASES[stem]["display_name"]
+    display = stem
     clifford_qasm = RAW_DIR / f"{stem}.cliffordt.qasm"
     trans_file = RAW_DIR / f"{stem}.trans"
     transpile_log = RAW_DIR / f"{stem}__transpile.log"
@@ -348,13 +359,14 @@ def new_payload(selected: list[str], benchmark_dir: Path, args: argparse.Namespa
         "schema_version": 2,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "description": (
-            "PureMagic results on the TopoLS repository benchmark circuits with readily "
+            "PureMagic results on the shared LS-Benchmarking circuits with readily "
             "available magic states and deterministic T injection."
         ),
         "selected_benchmarks": selected,
         "selected_methods": [METHOD_NAME],
         "benchmark_source_dir": str(benchmark_dir),
         "shared_puremagic_config": {
+            "max_gates": args.max_gates,
             "routing": "PureMagic dual-purpose ancilla routing",
             "use_magic_routing": True,
             "max_pauli_product_weight": MAX_PAULI_PRODUCT_WEIGHT,
@@ -420,12 +432,44 @@ def main() -> None:
     results_file = args.results_file.expanduser().resolve()
     args.transpiler = args.transpiler.expanduser().resolve()
     args.scheduler = args.scheduler.expanduser().resolve()
-    selected = args.benchmarks or PRESETS[args.preset]
 
     if args.ancilla_rows < 1:
         raise ValueError("--ancilla-rows must be at least 1")
+    if args.max_gates < 0:
+        raise ValueError("--max-gates must be >= 0")
     if not benchmark_dir.is_dir():
         raise FileNotFoundError(f"Benchmark directory not found: {benchmark_dir}")
+
+    metadata: dict[str, dict] = {}
+    paths = benchmark_paths(benchmark_dir, args.benchmarks)
+    print("\nSource:    ", benchmark_dir)
+    print("Max gates: ", args.max_gates or "disabled")
+    print("\n" + "=" * 84)
+    print("INPUT CIRCUIT SUMMARY")
+    print("=" * 84)
+    for qasm in paths:
+        stem = qasm.stem
+        meta = qasm_metadata(qasm)
+        if args.max_gates and meta["gate_count"] > args.max_gates:
+            print(
+                f"SKIP {stem:<36} gates={meta['gate_count']:<7} "
+                f"(limit {args.max_gates})"
+            )
+            continue
+        if meta["unsupported_gate_counts"]:
+            raise RuntimeError(f"{stem} has unsupported gates: {meta['unsupported_gate_counts']}")
+        metadata[stem] = meta
+        print(
+            f"RUN  {stem:<36} qubits={meta['num_qubits']:<3} "
+            f"gates={meta['gate_count']:<5} depth={meta['depth']:<5} T={meta['t_count']:<5} "
+            f"sha256={meta['qasm_sha256'][:12]}..."
+        )
+    print("=" * 84)
+
+    selected = list(metadata)
+    if not selected:
+        print("\nNo circuits are within the gate limit; nothing to run.")
+        return
 
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     if args.build:
@@ -440,41 +484,22 @@ def main() -> None:
     else:
         payload = new_payload(selected, benchmark_dir, args)
 
-    metadata: dict[str, dict] = {}
     print("\nBenchmarks:", ", ".join(selected))
     print("Method:    ", METHOD_LABEL)
-    print("Source:    ", benchmark_dir)
-    print("\n" + "=" * 84)
-    print("INPUT CIRCUIT SUMMARY")
-    print("=" * 84)
-    for stem in selected:
-        qasm = benchmark_dir / f"{stem}.qasm"
-        if not qasm.is_file():
-            raise FileNotFoundError(f"Missing benchmark: {qasm}")
-        meta = qasm_metadata(qasm)
-        if meta["unsupported_gate_counts"]:
-            raise RuntimeError(f"{stem} has unsupported gates: {meta['unsupported_gate_counts']}")
-        metadata[stem] = meta
-        print(
-            f"{CASES[stem]['display_name']:<10} qubits={meta['num_qubits']:<3} "
-            f"gates={meta['gate_count']:<5} depth={meta['depth']:<5} T={meta['t_count']:<5} "
-            f"sha256={meta['qasm_sha256'][:12]}..."
-        )
-    print("=" * 84)
 
     for stem in selected:
         entry = find_entry(payload, stem)
         if entry is None:
             entry = {
                 "stem": stem,
-                "display_name": CASES[stem]["display_name"],
+                "display_name": stem,
                 **metadata[stem],
                 "runs": [],
             }
             payload["benchmarks"].append(entry)
             write_payload(results_file, payload)
         if args.resume and completed(entry):
-            print(f"\nSkipping completed {CASES[stem]['display_name']} | {METHOD_LABEL}")
+            print(f"\nSkipping completed {stem} | {METHOD_LABEL}")
             continue
         run = run_one(stem, benchmark_dir / f"{stem}.qasm", args)
         entry["runs"] = [item for item in entry.get("runs", []) if item.get("method") != METHOD_NAME]
