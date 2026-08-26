@@ -7,7 +7,7 @@ stochastic T-injection failures enabled, and records critical-path magic-state
 delay emitted by the instrumented scheduler.
 
 Example:
-    python3 run_puremagic_part_b_benchmarks.py --max-gates 10000
+    python3 run_puremagic_part_b_benchmarks.py --max-gates 25000
 
 The summary JSON is written to LS-Benchmarking-Results, while raw logs and
 artifacts stay in PureMagic/results/benchmarking.
@@ -65,8 +65,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-gates",
         type=int,
-        default=10_000,
-        help="Skip circuits above this gate count (default: 10000; 0 disables).",
+        default=25_000,
+        help="Skip circuits above this gate count (default: 25000; 0 disables).",
     )
     parser.add_argument("--results-file", type=Path, default=DEFAULT_RESULTS)
     parser.add_argument("--transpiler", type=Path, default=DEFAULT_TRANSPILE)

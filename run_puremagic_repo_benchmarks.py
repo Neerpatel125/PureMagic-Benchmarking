@@ -8,7 +8,7 @@ Run from the PureMagic repository root:
 The JSON result is written directly to the sibling LS-Benchmarking-Results
 repository by default.
 
-Circuits above 10,000 gates are skipped by default. Change the cutoff with
+Circuits above 25,000 gates are skipped by default. Change the cutoff with
 ``--max-gates``; use 0 to disable it.
 
 Each complete transpiler+scheduler benchmark has a two-hour wall-time limit by
@@ -73,8 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-gates",
         type=int,
-        default=10_000,
-        help="Skip circuits above this gate count (default: 10000; 0 disables).",
+        default=25_000,
+        help="Skip circuits above this gate count (default: 25000; 0 disables).",
     )
     parser.add_argument("--results-file", type=Path, default=DEFAULT_RESULTS)
     parser.add_argument("--transpiler", type=Path, default=DEFAULT_TRANSPILE)
