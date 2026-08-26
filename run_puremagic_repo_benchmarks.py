@@ -11,6 +11,11 @@ repository by default.
 Circuits above 10,000 gates are skipped by default. Change the cutoff with
 ``--max-gates``; use 0 to disable it.
 
+Each complete transpiler+scheduler benchmark has a two-hour wall-time limit by
+default. Timed-out runs are recorded and the runner continues with the next
+benchmark. They are skipped by ``--resume`` and rerun only when starting a
+fresh run.
+
 The default configuration uses PureMagic routing, lightweight PBC (omega=1),
 disabled stochastic T-injection failures, and the repository's high-production
 setting (-m 100).  This is the readily-available-magic configuration used to
@@ -23,6 +28,7 @@ import argparse
 import hashlib
 import json
 import re
+import selectors
 import shutil
 import subprocess
 import time
@@ -51,6 +57,7 @@ MAGIC_STATE_LAMBDA = 100.0
 SUPPORTED_GATES = {"cx", "cz", "swap", "h", "s", "sdg", "sx", "sxdg", "x", "y", "z", "t", "tdg"}
 DISPLAY_GATE_NAMES = {"cx": "CNOT", "h": "HAD", "t": "T", "s": "S"}
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+DEFAULT_TIMEOUT_S = 7200.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,10 +82,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=29)
     parser.add_argument("--ancilla-rows", type=int, default=1)
     parser.add_argument(
+        "--timeout-s", type=float, default=DEFAULT_TIMEOUT_S,
+        help="Maximum wall time for each complete transpiler+scheduler benchmark (default: 2 hours).",
+    )
+    parser.add_argument(
         "--build", action=argparse.BooleanOptionalAction, default=True,
         help="Build release binaries before benchmarking (default: true).",
     )
-    parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Skip completed or timed-out entries already present in the result JSON.",
+    )
     return parser.parse_args()
 
 
@@ -154,7 +168,9 @@ def write_payload(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def tee_process(command: list[str], *, cwd: Path, log_path: Path) -> tuple[str, float]:
+def tee_process(
+    command: list[str], *, cwd: Path, log_path: Path, timeout_s: float
+) -> tuple[str, float]:
     start = time.perf_counter()
     lines: list[str] = []
     with log_path.open("w", encoding="utf-8") as log:
@@ -167,11 +183,33 @@ def tee_process(command: list[str], *, cwd: Path, log_path: Path) -> tuple[str, 
             bufsize=1,
         )
         assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="")
-            log.write(line)
-            lines.append(line)
-        returncode = process.wait()
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        try:
+            while process.poll() is None:
+                if time.perf_counter() - start > timeout_s:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    raise TimeoutError(
+                        f"Timed out after {timeout_s:.0f}s: {' '.join(command)}; see {log_path}"
+                    )
+                for key, _ in selector.select(timeout=0.25):
+                    line = key.fileobj.readline()
+                    if line:
+                        print(line, end="")
+                        log.write(line)
+                        lines.append(line)
+            for line in process.stdout:
+                print(line, end="")
+                log.write(line)
+                lines.append(line)
+        finally:
+            selector.close()
+        returncode = int(process.returncode or 0)
     elapsed = time.perf_counter() - start
     output = "".join(lines)
     if returncode != 0:
@@ -179,6 +217,15 @@ def tee_process(command: list[str], *, cwd: Path, log_path: Path) -> tuple[str, 
             f"Command failed with exit code {returncode}. See {log_path}\n{' '.join(command)}"
         )
     return output, elapsed
+
+
+def remaining_timeout(deadline: float, total_timeout_s: float, stage: str) -> float:
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0:
+        raise TimeoutError(
+            f"Timed out after {total_timeout_s:.0f}s before the {stage} stage could start."
+        )
+    return remaining
 
 
 def parse_required(pattern: str, output: str, description: str) -> re.Match[str]:
@@ -288,11 +335,18 @@ def run_one(stem: str, source_qasm: Path, args: argparse.Namespace) -> dict:
 
     print(f"\n--- {display} | {METHOD_LABEL} ---")
     process_wall_start = time.perf_counter()
+    deadline = process_wall_start + args.timeout_s
     transpile_stdout, transpile_process_wall_time_s = tee_process(
-        transpile_command, cwd=RAW_DIR, log_path=transpile_log
+        transpile_command,
+        cwd=RAW_DIR,
+        log_path=transpile_log,
+        timeout_s=remaining_timeout(deadline, args.timeout_s, "transpiler"),
     )
     scheduler_stdout, scheduler_process_wall_time_s = tee_process(
-        scheduler_command, cwd=RAW_DIR, log_path=scheduler_log
+        scheduler_command,
+        cwd=RAW_DIR,
+        log_path=scheduler_log,
+        timeout_s=remaining_timeout(deadline, args.timeout_s, "scheduler"),
     )
     process_wall_time_s = time.perf_counter() - process_wall_start
     transpiler_metrics = parse_transpiler_output(transpile_stdout)
@@ -378,6 +432,7 @@ def new_payload(selected: list[str], benchmark_dir: Path, args: argparse.Namespa
             "t_injection_failures": False,
             "random_seed": args.seed,
             "ancilla_rows": args.ancilla_rows,
+            "timeout_s_per_benchmark": args.timeout_s,
             "metric_definition": {
                 "space": (
                     "Number of nodes in the generated logical-patch topology: data patches "
@@ -421,9 +476,20 @@ def find_entry(payload: dict, stem: str) -> dict | None:
 
 def completed(entry: dict) -> bool:
     return any(
-        run.get("method") == METHOD_NAME and run.get("status", "ok") == "ok"
+        run.get("method") == METHOD_NAME
+        and run.get("status", "ok") in {"ok", "timeout"}
         for run in entry.get("runs", [])
     )
+
+
+def timeout_run(timeout_s: float, error: Exception) -> dict:
+    return {
+        "method": METHOD_NAME,
+        "label": METHOD_LABEL,
+        "status": "timeout",
+        "timeout_s": timeout_s,
+        "error": str(error),
+    }
 
 
 def main() -> None:
@@ -437,6 +503,8 @@ def main() -> None:
         raise ValueError("--ancilla-rows must be at least 1")
     if args.max_gates < 0:
         raise ValueError("--max-gates must be >= 0")
+    if args.timeout_s <= 0:
+        raise ValueError("--timeout-s must be positive")
     if not benchmark_dir.is_dir():
         raise FileNotFoundError(f"Benchmark directory not found: {benchmark_dir}")
 
@@ -486,6 +554,7 @@ def main() -> None:
 
     print("\nBenchmarks:", ", ".join(selected))
     print("Method:    ", METHOD_LABEL)
+    print("Timeout:   ", f"{args.timeout_s:.0f}s per benchmark pipeline")
 
     for stem in selected:
         entry = find_entry(payload, stem)
@@ -499,9 +568,14 @@ def main() -> None:
             payload["benchmarks"].append(entry)
             write_payload(results_file, payload)
         if args.resume and completed(entry):
-            print(f"\nSkipping completed {stem} | {METHOD_LABEL}")
+            print(f"\nSkipping completed/timed-out {stem} | {METHOD_LABEL}")
             continue
-        run = run_one(stem, benchmark_dir / f"{stem}.qasm", args)
+        try:
+            run = run_one(stem, benchmark_dir / f"{stem}.qasm", args)
+        except TimeoutError as exc:
+            print(f"TIMEOUT: {exc}")
+            print("Continuing to the next benchmark.")
+            run = timeout_run(args.timeout_s, exc)
         entry["runs"] = [item for item in entry.get("runs", []) if item.get("method") != METHOD_NAME]
         entry["runs"].append(run)
         write_payload(results_file, payload)

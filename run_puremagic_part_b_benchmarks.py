@@ -11,6 +11,11 @@ Example:
 
 The summary JSON is written to LS-Benchmarking-Results, while raw logs and
 artifacts stay in PureMagic/results/benchmarking.
+
+Each complete transpiler+scheduler benchmark has a two-hour wall-time limit by
+default. Timed-out runs are recorded and the runner continues with the next
+benchmark. They are skipped by ``--resume`` and rerun only when starting a
+fresh run.
 """
 
 from __future__ import annotations
@@ -77,13 +82,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ancilla-rows", type=int, default=1)
     parser.add_argument(
         "--timeout-s", type=float, default=7200.0,
-        help="Timeout for each transpiler or scheduler process (default: 2 hours).",
+        help="Maximum wall time for each complete transpiler+scheduler benchmark (default: 2 hours).",
     )
     parser.add_argument(
         "--build", action=argparse.BooleanOptionalAction, default=True,
         help="Build release binaries before benchmarking (default: true).",
     )
-    parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Skip completed or timed-out entries already present in the result JSON.",
+    )
     return parser.parse_args()
 
 
@@ -112,6 +120,7 @@ def tee_process(
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         process.kill()
+                        process.wait()
                     raise TimeoutError(
                         f"Timed out after {timeout_s:.0f}s: {' '.join(command)}; see {log_path}"
                     )
@@ -135,6 +144,15 @@ def tee_process(
     return "".join(lines), elapsed
 
 
+def remaining_timeout(deadline: float, total_timeout_s: float, stage: str) -> float:
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0:
+        raise TimeoutError(
+            f"Timed out after {total_timeout_s:.0f}s before the {stage} stage could start."
+        )
+    return remaining
+
+
 def parse_delay(output: str) -> int:
     match = common.parse_required(
         r"^Magic-state delay:\s*(\d+)\s+logical cycles\s*$",
@@ -150,7 +168,13 @@ def build_release_binaries() -> None:
     subprocess.run(command, cwd=REPO_ROOT, check=True)
 
 
-def run_transpiler(stem: str, source_qasm: Path, args: argparse.Namespace, raw_dir: Path) -> dict:
+def run_transpiler(
+    stem: str,
+    source_qasm: Path,
+    args: argparse.Namespace,
+    raw_dir: Path,
+    timeout_s: float,
+) -> dict:
     clifford_qasm = raw_dir / f"{stem}.cliffordt.qasm"
     trans_file = raw_dir / f"{stem}.trans"
     log_path = raw_dir / f"{stem}__transpile.log"
@@ -162,7 +186,7 @@ def run_transpiler(stem: str, source_qasm: Path, args: argparse.Namespace, raw_d
         "--max_width", str(MAX_PAULI_PRODUCT_WEIGHT),
     ]
     output, process_wall = tee_process(
-        command, cwd=raw_dir, log_path=log_path, timeout_s=args.timeout_s
+        command, cwd=raw_dir, log_path=log_path, timeout_s=timeout_s
     )
     metrics = common.parse_transpiler_output(output)
     metrics["benchmark_wall_time_s"] = common.parse_benchmark_wall_time(output, "transpiler")
@@ -183,6 +207,7 @@ def run_scheduler_trial(
     transpiler_metrics: dict,
     args: argparse.Namespace,
     raw_dir: Path,
+    timeout_s: float,
 ) -> dict:
     log_path = raw_dir / f"{stem}__seed_{seed}__puremagic.log"
     command = [
@@ -195,7 +220,7 @@ def run_scheduler_trial(
     ]
     # Deliberately no --no-t-failures: the 50% injection-outcome model is enabled.
     output, process_wall = tee_process(
-        command, cwd=raw_dir, log_path=log_path, timeout_s=args.timeout_s
+        command, cwd=raw_dir, log_path=log_path, timeout_s=timeout_s
     )
     scheduler_metrics = common.parse_scheduler_output(output)
     scheduler_wall = common.parse_benchmark_wall_time(output, "scheduler")
@@ -281,7 +306,7 @@ def new_payload(selected: list[str], benchmark_dir: Path, args: argparse.Namespa
             "t_injection_success_probability": 0.5,
             "seeds": args.seeds,
             "ancilla_rows": args.ancilla_rows,
-            "timeout_s_per_process": args.timeout_s,
+            "timeout_s_per_benchmark": args.timeout_s,
             "metric_definition": {
                 "space": "PureMagic topology nodes: data + bus + magic patches.",
                 "time": "PureMagic scheduler lcycles; one lcycle is one logical cube layer.",
@@ -316,9 +341,23 @@ def find_entry(payload: dict, stem: str) -> dict | None:
 
 def completed(entry: dict, seeds: list[int]) -> bool:
     for run in entry.get("runs", []):
-        if run.get("method") == METHOD_NAME and run.get("status") == "ok":
+        if run.get("method") != METHOD_NAME:
+            continue
+        if run.get("status") == "timeout":
+            return True
+        if run.get("status") == "ok":
             return {trial.get("seed") for trial in run.get("trials", [])} == set(seeds)
     return False
+
+
+def timeout_run(timeout_s: float, error: Exception) -> dict:
+    return {
+        "method": METHOD_NAME,
+        "label": METHOD_LABEL,
+        "status": "timeout",
+        "timeout_s": timeout_s,
+        "error": str(error),
+    }
 
 
 def main() -> None:
@@ -409,6 +448,7 @@ def main() -> None:
     print("Seeds:     ", ", ".join(map(str, args.seeds)))
     print("Lambda:    ", args.magic_state_lambda)
     print("T failures: enabled")
+    print("Timeout:   ", f"{args.timeout_s:.0f}s per benchmark pipeline")
     for stem in selected:
         qasm = args.benchmark_dir / f"{stem}.qasm"
         metadata = metadata_by_stem[stem]
@@ -427,38 +467,60 @@ def main() -> None:
                 f"{stem}: QASM changed since this JSON was created; use a new --results-file"
             )
         if args.resume and completed(entry, args.seeds):
-            print(f"Skipping completed {stem}")
+            print(f"Skipping completed/timed-out {stem}")
             continue
 
         print(f"\n--- {stem} | PureMagic Part-B supply ---")
-        transpiler = run_transpiler(stem, qasm, args, raw_dir)
-        trials = [
-            run_scheduler_trial(
-                stem, seed, transpiler["trans_file"], transpiler["metrics"], args, raw_dir
+        deadline = time.perf_counter() + args.timeout_s
+        try:
+            transpiler = run_transpiler(
+                stem,
+                qasm,
+                args,
+                raw_dir,
+                remaining_timeout(deadline, args.timeout_s, "transpiler"),
             )
-            for seed in args.seeds
-        ]
-        run = {
-            "method": METHOD_NAME,
-            "label": METHOD_LABEL,
-            "status": "ok",
-            "metrics": aggregate_trials(trials),
-            "transpiler_metrics": transpiler["metrics"],
-            "trials": trials,
-            "artifacts": {
-                "clifford_t_qasm": str(transpiler["clifford_qasm"].resolve()),
-                "transpiled_circuit": str(transpiler["trans_file"].resolve()),
-                "transpiler_log": str(transpiler["log_path"].resolve()),
-            },
-            "transpile_command": transpiler["command"],
-        }
+            trials = []
+            for seed in args.seeds:
+                trials.append(
+                    run_scheduler_trial(
+                        stem,
+                        seed,
+                        transpiler["trans_file"],
+                        transpiler["metrics"],
+                        args,
+                        raw_dir,
+                        remaining_timeout(
+                            deadline, args.timeout_s, f"scheduler seed {seed}"
+                        ),
+                    )
+                )
+            run = {
+                "method": METHOD_NAME,
+                "label": METHOD_LABEL,
+                "status": "ok",
+                "metrics": aggregate_trials(trials),
+                "transpiler_metrics": transpiler["metrics"],
+                "trials": trials,
+                "artifacts": {
+                    "clifford_t_qasm": str(transpiler["clifford_qasm"].resolve()),
+                    "transpiled_circuit": str(transpiler["trans_file"].resolve()),
+                    "transpiler_log": str(transpiler["log_path"].resolve()),
+                },
+                "transpile_command": transpiler["command"],
+            }
+        except TimeoutError as exc:
+            print(f"TIMEOUT: {exc}")
+            print("Continuing to the next benchmark.")
+            run = timeout_run(args.timeout_s, exc)
         entry["runs"] = [r for r in entry.get("runs", []) if r.get("method") != METHOD_NAME] + [run]
         write_payload(args.results_file, payload)
-        print(
-            f"{stem}: volume={run['metrics']['volume']:.3f}, "
-            f"delay={run['metrics']['delay']:.3f} lcycles, "
-            f"fair wall={run['metrics']['wall_time_s']:.6f}s"
-        )
+        if run["status"] == "ok":
+            print(
+                f"{stem}: volume={run['metrics']['volume']:.3f}, "
+                f"delay={run['metrics']['delay']:.3f} lcycles, "
+                f"fair wall={run['metrics']['wall_time_s']:.6f}s"
+            )
 
     print(f"\nSaved Part-B comparison JSON to {args.results_file}")
     print(f"Saved raw PureMagic logs and artifacts to {raw_dir}")
