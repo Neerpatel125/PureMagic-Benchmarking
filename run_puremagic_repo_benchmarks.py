@@ -12,9 +12,9 @@ Circuits above 25,000 gates are skipped by default. Change the cutoff with
 ``--max-gates``; use 0 to disable it.
 
 Each complete transpiler+scheduler benchmark has a two-hour wall-time limit by
-default. Timed-out runs are recorded and the runner continues with the next
-benchmark. They are skipped by ``--resume`` and rerun only when starting a
-fresh run.
+default. Timed-out and failed runs are recorded and the runner continues with
+the next benchmark. ``--resume`` skips successful and timed-out runs but
+retries failures, so failed cases can be rerun after applying a hotfix.
 
 The default configuration uses PureMagic routing, lightweight PBC (omega=1),
 disabled stochastic T-injection failures, and the repository's high-production
@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--resume", action="store_true",
-        help="Skip completed or timed-out entries already present in the result JSON.",
+        help="Skip successful or timed-out entries and retry failed ones already present in the result JSON.",
     )
     return parser.parse_args()
 
@@ -410,7 +410,7 @@ def run_one(stem: str, source_qasm: Path, args: argparse.Namespace) -> dict:
 
 def new_payload(selected: list[str], benchmark_dir: Path, args: argparse.Namespace) -> dict:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "description": (
             "PureMagic results on the shared LS-Benchmarking circuits with readily "
@@ -482,14 +482,27 @@ def completed(entry: dict) -> bool:
     )
 
 
-def timeout_run(timeout_s: float, error: Exception) -> dict:
-    return {
+def unsuccessful_run(
+    stem: str,
+    status: str,
+    error: Exception,
+    *,
+    timeout_s: float | None = None,
+) -> dict:
+    run = {
         "method": METHOD_NAME,
         "label": METHOD_LABEL,
-        "status": "timeout",
-        "timeout_s": timeout_s,
+        "status": status,
+        "error_type": type(error).__name__,
         "error": str(error),
+        "artifacts": {
+            "transpiler_log": str((RAW_DIR / f"{stem}__transpile.log").resolve()),
+            "scheduler_log": str((RAW_DIR / f"{stem}__puremagic.log").resolve()),
+        },
     }
+    if timeout_s is not None:
+        run["timeout_s"] = timeout_s
+    return run
 
 
 def main() -> None:
@@ -568,14 +581,23 @@ def main() -> None:
             payload["benchmarks"].append(entry)
             write_payload(results_file, payload)
         if args.resume and completed(entry):
-            print(f"\nSkipping completed/timed-out {stem} | {METHOD_LABEL}")
+            print(f"\nSkipping successful/timed-out result {stem} | {METHOD_LABEL}")
             continue
         try:
             run = run_one(stem, benchmark_dir / f"{stem}.qasm", args)
         except TimeoutError as exc:
             print(f"TIMEOUT: {exc}")
             print("Continuing to the next benchmark.")
-            run = timeout_run(args.timeout_s, exc)
+            run = unsuccessful_run(
+                stem,
+                "timeout",
+                exc,
+                timeout_s=args.timeout_s,
+            )
+        except Exception as exc:
+            print(f"FAILED: {stem} | {METHOD_LABEL}: {exc}")
+            print("Continuing to the next benchmark.")
+            run = unsuccessful_run(stem, "failed", exc)
         entry["runs"] = [item for item in entry.get("runs", []) if item.get("method") != METHOD_NAME]
         entry["runs"].append(run)
         write_payload(results_file, payload)
