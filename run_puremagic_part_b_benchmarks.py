@@ -13,9 +13,10 @@ The summary JSON is written to LS-Benchmarking-Results, while raw logs and
 artifacts stay in PureMagic/results/benchmarking.
 
 Each complete transpiler+scheduler benchmark has a two-hour wall-time limit by
-default. Timed-out runs are recorded and the runner continues with the next
-benchmark. They are skipped by ``--resume`` and rerun only when starting a
-fresh run.
+default. Timed-out and failed runs are recorded and the runner continues with
+the next benchmark. ``--resume`` skips successful and RuntimeError runs. It
+also skips timed-out runs unless ``--timeout-s`` changed, in which case those
+runs are retried. Changing ``--max-gates`` only changes circuit eligibility.
 """
 
 from __future__ import annotations
@@ -90,7 +91,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--resume", action="store_true",
-        help="Skip completed or timed-out entries already present in the result JSON.",
+        help=(
+            "Skip successful and RuntimeError entries. Timed-out entries are skipped "
+            "unless --timeout-s changed, in which case they are retried."
+        ),
     )
     return parser.parse_args()
 
@@ -339,15 +343,25 @@ def find_entry(payload: dict, stem: str) -> dict | None:
     return next((entry for entry in payload.get("benchmarks", []) if entry.get("stem") == stem), None)
 
 
-def completed(entry: dict, seeds: list[int]) -> bool:
-    for run in entry.get("runs", []):
-        if run.get("method") != METHOD_NAME:
-            continue
-        if run.get("status") == "timeout":
-            return True
-        if run.get("status") == "ok":
-            return {trial.get("seed") for trial in run.get("trials", [])} == set(seeds)
-    return False
+def completed(
+    entry: dict, seeds: list[int], *, timeout_s_changed: bool = False
+) -> bool:
+    runs = [
+        run for run in entry.get("runs", []) if run.get("method") == METHOD_NAME
+    ]
+    if any(
+        run.get("status") == "ok"
+        and {trial.get("seed") for trial in run.get("trials", [])} == set(seeds)
+        for run in runs
+    ):
+        return True
+    if any(run.get("error_type") == "RuntimeError" for run in runs):
+        return True
+    return not timeout_s_changed and any(
+        run.get("status") == "timeout"
+        or run.get("error_type") == "TimeoutError"
+        for run in runs
+    )
 
 
 def timeout_run(timeout_s: float, error: Exception) -> dict:
@@ -356,6 +370,17 @@ def timeout_run(timeout_s: float, error: Exception) -> dict:
         "label": METHOD_LABEL,
         "status": "timeout",
         "timeout_s": timeout_s,
+        "error_type": type(error).__name__,
+        "error": str(error),
+    }
+
+
+def failed_run(error: Exception) -> dict:
+    return {
+        "method": METHOD_NAME,
+        "label": METHOD_LABEL,
+        "status": "failed",
+        "error_type": type(error).__name__,
         "error": str(error),
     }
 
@@ -418,9 +443,10 @@ def main() -> None:
 
     raw_dir = DEFAULT_RAW_DIR
     raw_dir.mkdir(parents=True, exist_ok=True)
+    timeout_s_changed = False
     if args.resume and args.results_file.exists():
         payload = json.loads(args.results_file.read_text(encoding="utf-8"))
-        config = payload.get("shared_puremagic_part_b_config", {})
+        config = payload.setdefault("shared_puremagic_part_b_config", {})
         if config.get("seeds") is not None and config["seeds"] != args.seeds:
             raise ValueError(
                 f"Cannot --resume with seeds {args.seeds}; JSON was created with {config['seeds']}"
@@ -435,12 +461,21 @@ def main() -> None:
             and int(config["ancilla_rows"]) != args.ancilla_rows
         ):
             raise ValueError("Cannot --resume with a different --ancilla-rows")
-        if config.get("max_gates") not in (None, args.max_gates):
-            raise ValueError("Cannot --resume with a different --max-gates")
+        configured_timeout_s = config.get("timeout_s_per_benchmark")
+        timeout_s_changed = configured_timeout_s != args.timeout_s
         payload["selected_benchmarks"] = list(
             dict.fromkeys(payload.get("selected_benchmarks", []) + selected)
         )
         write_payload(args.results_file, payload)
+        if timeout_s_changed:
+            configured_label = (
+                "unknown" if configured_timeout_s is None else f"{configured_timeout_s:g}s"
+            )
+            print(
+                "Timeout changed: "
+                f"{configured_label} -> {args.timeout_s:g}s; "
+                "timed-out results will be retried."
+            )
     else:
         payload = new_payload(selected, args.benchmark_dir, args)
 
@@ -466,8 +501,12 @@ def main() -> None:
             raise RuntimeError(
                 f"{stem}: QASM changed since this JSON was created; use a new --results-file"
             )
-        if args.resume and completed(entry, args.seeds):
-            print(f"Skipping completed/timed-out {stem}")
+        if args.resume and completed(
+            entry,
+            args.seeds,
+            timeout_s_changed=timeout_s_changed,
+        ):
+            print(f"Skipping successful/unchanged-timeout/RuntimeError {stem}")
             continue
 
         print(f"\n--- {stem} | PureMagic Part-B supply ---")
@@ -513,6 +552,10 @@ def main() -> None:
             print(f"TIMEOUT: {exc}")
             print("Continuing to the next benchmark.")
             run = timeout_run(args.timeout_s, exc)
+        except Exception as exc:
+            print(f"FAILED: {stem} | {METHOD_LABEL}: {exc}")
+            print("Continuing to the next benchmark.")
+            run = failed_run(exc)
         entry["runs"] = [r for r in entry.get("runs", []) if r.get("method") != METHOD_NAME] + [run]
         write_payload(args.results_file, payload)
         if run["status"] == "ok":
@@ -522,6 +565,12 @@ def main() -> None:
                 f"fair wall={run['metrics']['wall_time_s']:.6f}s"
             )
 
+    # Commit the new timeout only after the pass completes. If this process is
+    # interrupted, the next resume still retries timeouts it did not reach.
+    config = payload.setdefault("shared_puremagic_part_b_config", {})
+    config["max_gates"] = args.max_gates
+    config["timeout_s_per_benchmark"] = args.timeout_s
+    write_payload(args.results_file, payload)
     print(f"\nSaved Part-B comparison JSON to {args.results_file}")
     print(f"Saved raw PureMagic logs and artifacts to {raw_dir}")
 
