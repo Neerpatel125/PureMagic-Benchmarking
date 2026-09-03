@@ -11,6 +11,7 @@ Example:
 
 The summary JSON is written to LS-Benchmarking-Results, while raw logs and
 artifacts stay in PureMagic/results/benchmarking.
+Default result filenames include lambda, e.g. puremagic_part_b_results_lambda_0.5.json.
 
 Each complete transpiler+scheduler benchmark has a two-hour wall-time limit by
 default. Timed-out and failed runs are recorded and the runner continues with
@@ -69,7 +70,10 @@ def parse_args() -> argparse.Namespace:
         default=25_000,
         help="Skip circuits above this gate count (default: 25000; 0 disables).",
     )
-    parser.add_argument("--results-file", type=Path, default=DEFAULT_RESULTS)
+    parser.add_argument(
+        "--results-file", type=Path,
+        help="Override the default puremagic_part_b_results_lambda_<value>.json path.",
+    )
     parser.add_argument("--transpiler", type=Path, default=DEFAULT_TRANSPILE)
     parser.add_argument("--scheduler", type=Path, default=DEFAULT_SCHEDULER)
     parser.add_argument(
@@ -96,7 +100,12 @@ def parse_args() -> argparse.Namespace:
             "unless --timeout-s changed, in which case they are retried."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.results_file is None:
+        args.results_file = DEFAULT_RESULTS.with_name(
+            f"{DEFAULT_RESULTS.stem}_lambda_{args.magic_state_lambda}{DEFAULT_RESULTS.suffix}"
+        )
+    return args
 
 
 def tee_process(
